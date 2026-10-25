@@ -2,6 +2,10 @@
 
 Extension WordPress de maintenance et de publication pilotée par Claude (BK COM AND MARK).
 
+## Code source
+
+Le code est dans le dossier `maintenance-pilote/`. Le fichier `maintenance-pilote.zip` joint à chaque release est ce dossier compressé (Finder : clic droit sur le dossier > Compresser), avec le dossier `maintenance-pilote/` à la racine de l'archive.
+
 ## Publier une nouvelle version
 
 1. Onglet **Releases** > **Draft a new release**.
