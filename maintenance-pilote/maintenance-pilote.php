@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       Maintenance Pilote
  * Description:       Actions de maintenance et de publication contrôlées (état des mises à jour, mise à jour élément par élément avec copie de sécurité, retour arrière, vérification du site) exposées à Claude via l'API Abilities de WordPress.
- * Version:           2.4.1
+ * Version:           2.5.0
  * Requires at least: 6.9
  * Requires PHP:      7.4
  * Author:            BK COM AND MARK
@@ -15,10 +15,11 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'MP_VERSION', '2.4.1' );
+define( 'MP_VERSION', '2.5.0' );
 define( 'MP_SNAP_DIR', WP_CONTENT_DIR . '/maintenance-pilote-snapshots' );
 define( 'MP_SNAP_KEEP', 3 );
 define( 'MP_GITHUB_REPO', 'bkcomandmark/maintenance-pilote' );
+define( 'MP_CORE_BACKUP_MAX_HOURS', 6 ); // Âge maximal de la sauvegarde complète exigée avant une mise à jour du cœur (BK WEB Backup).
 
 /* -------------------------------------------------------------------------
  * Outils internes
@@ -138,7 +139,119 @@ function mp_read_wp_version() {
 	return get_bloginfo( 'version' );
 }
 
+/*
+ * BK WEB Backup (extension de sauvegarde de l'agence, installée site par site) : tout doit
+ * fonctionner avec ou sans elle, donc toujours passer par ces fonctions.
+ */
+
+function mp_bkwb_active() {
+	return function_exists( 'bkwb_get_status' ) && function_exists( 'bkwb_start_backup' );
+}
+
+/** État complet des sauvegardes selon BK WEB Backup (même format que l'action « sauvegardes »). */
+function mp_bkwb_status() {
+	try {
+		$status = bkwb_get_status();
+	} catch ( \Throwable $e ) {
+		return new WP_Error( 'mp_bkwb', 'Lecture de l\'état de BK WEB Backup impossible : ' . $e->getMessage() );
+	}
+	return is_array( $status ) ? $status : new WP_Error( 'mp_bkwb', 'Réponse inattendue de BK WEB Backup.' );
+}
+
+/**
+ * Lance une sauvegarde en arrière-plan, sans attendre la fin. Si BK WEB Backup refuse
+ * (tâche déjà en cours), le message précise la tâche et son avancement.
+ */
+function mp_bkwb_start( $content, $trigger ) {
+	try {
+		$started = bkwb_start_backup( $content, $trigger );
+	} catch ( \Throwable $e ) {
+		$started = new WP_Error( 'mp_bkwb', $e->getMessage() );
+	}
+	if ( is_wp_error( $started ) ) {
+		$status = mp_bkwb_status();
+		$job    = ! is_wp_error( $status ) && ! empty( $status['en_cours'] ) && is_array( $status['en_cours'] ) ? $status['en_cours'] : null;
+		if ( ! $job ) {
+			return new WP_Error( 'mp_bkwb', $started->get_error_message() );
+		}
+		return new WP_Error(
+			'mp_backup_running',
+			$started->get_error_message() . ' Tâche en cours : ' . ( 'restore' === ( $job['type'] ?? '' ) ? 'restauration' : 'sauvegarde' )
+				. ', étape « ' . ( $job['etape'] ?? '?' ) . ' », ' . (int) ( $job['progression'] ?? 0 ) . ' %.'
+		);
+	}
+	if ( ! is_array( $started ) ) {
+		return new WP_Error( 'mp_bkwb', 'Réponse inattendue de BK WEB Backup au lancement de la sauvegarde.' );
+	}
+	return $started;
+}
+
+/** Dernière sauvegarde complète (fichiers + base) réussie dans l'historique BK WEB Backup, ou null. */
+function mp_bkwb_last_full( $status ) {
+	$best = 0;
+	foreach ( (array) ( $status['historique'] ?? array() ) as $h ) {
+		if ( ! is_array( $h ) || 'reussie' !== ( $h['statut'] ?? '' ) || 'files+db' !== ( $h['contenu'] ?? '' ) ) {
+			continue;
+		}
+		$ts   = strtotime( (string) ( $h['date'] ?? '' ) );
+		$best = $ts && $ts > $best ? $ts : $best;
+	}
+	return $best ? array( 'date' => gmdate( 'c', $best ), 'age_heures' => round( ( time() - $best ) / 3600, 1 ) ) : null;
+}
+
+/**
+ * Avant une mise à jour du cœur, si BK WEB Backup est actif : exige une sauvegarde complète
+ * réussie de moins de MP_CORE_BACKUP_MAX_HOURS heures ; sinon en lance une et refuse.
+ * Sans BK WEB Backup, renvoie true (comportement inchangé).
+ */
+function mp_core_backup_gate() {
+	if ( ! mp_bkwb_active() ) {
+		return true;
+	}
+	$status = mp_bkwb_status();
+	if ( is_wp_error( $status ) ) {
+		return new WP_Error( 'mp_backup_required', 'Mise à jour de WordPress non effectuée : ' . $status->get_error_message() );
+	}
+	$full = mp_bkwb_last_full( $status );
+	if ( $full && $full['age_heures'] < MP_CORE_BACKUP_MAX_HOURS ) {
+		return true;
+	}
+	$msg = 'Mise à jour de WordPress non effectuée : il faut une sauvegarde complète (fichiers + base) réussie depuis moins de '
+		. MP_CORE_BACKUP_MAX_HOURS . ' heures, or '
+		. ( $full ? 'la dernière remonte à ' . $full['age_heures'] . ' heures (' . $full['date'] . ').' : 'BK WEB Backup n\'en signale aucune.' ) . ' ';
+
+	$started = mp_bkwb_start( 'full', 'avant mise à jour du cœur' );
+	if ( is_wp_error( $started ) ) {
+		if ( 'mp_backup_running' === $started->get_error_code() ) {
+			return new WP_Error( 'mp_backup_running', $msg . 'Pas de nouvelle sauvegarde lancée. ' . $started->get_error_message() . ' Relancer la mise à jour une fois cette tâche terminée.' );
+		}
+		return new WP_Error( 'mp_backup_required', $msg . 'Lancement de la sauvegarde impossible. ' . $started->get_error_message() );
+	}
+	return new WP_Error(
+		'mp_backup_required',
+		$msg . 'Une sauvegarde complète vient d\'être lancée en arrière-plan (' . ( $started['nom'] ?? '?' ) . '). '
+			. 'Relancer la mise à jour de WordPress une fois cette sauvegarde terminée (avancement : maintenance-pilote-sauvegardes, champ « en_cours »).',
+		$started
+	);
+}
+
 function mp_backup_status() {
+	if ( mp_bkwb_active() ) {
+		$s = mp_bkwb_status();
+		if ( is_wp_error( $s ) ) {
+			return array( 'outil' => 'BK WEB Backup', 'message' => $s->get_error_message() );
+		}
+		return array(
+			'outil'                       => $s['outil'] ?? 'BK WEB Backup',
+			'derniere_reussie'            => $s['derniere_reussie'] ?? null,
+			'age_heures_derniere_reussie' => $s['age_heures_derniere_reussie'] ?? null,
+			'derniere_complete_reussie'   => mp_bkwb_last_full( $s ),
+			'derniere_tentative_statut'   => $s['derniere_tentative']['statut'] ?? null,
+			'planification'               => ! empty( $s['planification']['active'] ) ? ( $s['planification']['frequence'] ?? 'active' ) : 'desactivee',
+			'copie_distante'              => ! empty( $s['stockage_distant']['utilise_par_planification'] ),
+			'en_cours'                    => $s['en_cours'] ?? null,
+		);
+	}
 	$reports = get_option( 'wpvivid_backup_reports' );
 	if ( ! is_array( $reports ) || empty( $reports ) ) {
 		return array(
@@ -325,15 +438,36 @@ function mp_find_email( $data, $depth = 0 ) {
 }
 
 /**
- * Suivi détaillé des sauvegardes WPvivid : historique, planification, stockage distant,
- * dernière erreur, et autres extensions de sauvegarde actives.
+ * Statut normalisé d'un rapport WPvivid : « Succeeded » → reussie ; « Failed », « Error »,
+ * ou « failed, <message> » → echec, avec le message. Renvoie array( statut, message|null ).
+ */
+function mp_wpvivid_report_status( $raw ) {
+	$raw = trim( (string) $raw );
+	if ( 'succeeded' === strtolower( $raw ) ) {
+		return array( 'reussie', null );
+	}
+	if ( preg_match( '/^(?:failed|error)\b[\s,:.\-]*(.*)$/is', $raw, $m ) ) {
+		$detail = trim( wp_strip_all_tags( $m[1] ) );
+		return array( 'echec', '' !== $detail ? mb_substr( $detail, 0, 300 ) : null );
+	}
+	return array( '' !== $raw ? strtolower( $raw ) : 'inconnu', null );
+}
+
+/**
+ * Suivi détaillé des sauvegardes : celui de BK WEB Backup s'il est actif, sinon celui de
+ * WPvivid (historique, planification, stockage distant, dernière erreur, et autres
+ * extensions de sauvegarde actives).
  */
 function mp_ability_backups( $input = null ) {
+	if ( mp_bkwb_active() ) {
+		return mp_bkwb_status();
+	}
 	mp_load_admin();
 	global $wpdb;
 	$file   = 'wpvivid-backuprestore/wpvivid-backuprestore.php';
 	$all    = get_plugins();
 	$out    = array(
+		'outil'   => is_plugin_active( $file ) ? 'WPvivid' : null,
 		'wpvivid' => array(
 			'installe' => isset( $all[ $file ] ),
 			'actif'    => is_plugin_active( $file ),
@@ -349,11 +483,13 @@ function mp_ability_backups( $input = null ) {
 			if ( ! is_array( $r ) || empty( $r['backup_time'] ) ) {
 				continue;
 			}
-			$st     = isset( $r['status'] ) ? (string) $r['status'] : '';
+			// Les échecs sont souvent enregistrés sous la forme « failed, <message> ».
+			list( $statut, $detail ) = mp_wpvivid_report_status( $r['status'] ?? '' );
 			$hist[] = array(
 				'date'   => gmdate( 'c', (int) $r['backup_time'] ),
 				'ts'     => (int) $r['backup_time'],
-				'statut' => 'Succeeded' === $st ? 'reussie' : ( in_array( $st, array( 'Failed', 'Error', 'error' ), true ) ? 'echec' : ( '' !== $st ? strtolower( $st ) : 'inconnu' ) ),
+				'statut' => $statut,
+				'erreur' => $detail,
 			);
 		}
 	}
@@ -380,7 +516,13 @@ function mp_ability_backups( $input = null ) {
 	$out['reussites_30j']               = $ok30;
 	$out['echecs_30j']                  = $ko30;
 	$out['historique']                  = array_map(
-		function ( $h ) { return array( 'date' => $h['date'], 'statut' => $h['statut'] ); },
+		function ( $h ) {
+			$row = array( 'date' => $h['date'], 'statut' => $h['statut'] );
+			if ( $h['erreur'] ) {
+				$row['erreur'] = $h['erreur'];
+			}
+			return $row;
+		},
 		array_slice( $hist, 0, 20 )
 	);
 
@@ -481,6 +623,26 @@ function mp_ability_backups( $input = null ) {
 	$out['autres_extensions_sauvegarde'] = $found;
 	$out['verifie_le']                   = gmdate( 'c' );
 	return $out;
+}
+
+/**
+ * Lance une sauvegarde BK WEB Backup en arrière-plan (action déclarée seulement si
+ * BK WEB Backup est actif). Aucune restauration : elle reste dans l'admin de BK WEB Backup.
+ */
+function mp_ability_start_backup( $input = null ) {
+	if ( ! mp_bkwb_active() ) {
+		return new WP_Error( 'mp_bkwb', 'BK WEB Backup n\'est pas actif sur ce site.' );
+	}
+	$content = is_array( $input ) && isset( $input['contenu'] ) && 'db' === $input['contenu'] ? 'db' : 'full';
+	$started = mp_bkwb_start( $content, 'maintenance-pilote' );
+	if ( is_wp_error( $started ) ) {
+		return $started;
+	}
+	return array_merge(
+		array( 'statut' => 'lancee' ),
+		$started,
+		array( 'remarque' => 'Sauvegarde lancée en arrière-plan. Suivre son avancement avec maintenance-pilote-sauvegardes (champ « en_cours », puis historique).' )
+	);
 }
 
 function mp_ability_etat( $input = null ) {
@@ -835,6 +997,11 @@ function mp_ability_update_core( $input = null ) {
 		$before = mp_read_wp_version();
 		if ( ! $update || 'upgrade' !== $update->response ) {
 			return array( 'statut' => 'deja_a_jour', 'version' => $before );
+		}
+		// Avec BK WEB Backup : pas de mise à jour du cœur sans sauvegarde complète récente.
+		$gate = mp_core_backup_gate();
+		if ( is_wp_error( $gate ) ) {
+			return $gate;
 		}
 		$skin     = new Automatic_Upgrader_Skin();
 		$upgrader = new Core_Upgrader( $skin );
@@ -1951,7 +2118,7 @@ function mp_ability_update_seo( $input = null ) {
  * ---------------------------------------------------------------------- */
 
 function mp_ability_names() {
-	return array(
+	$names = array(
 		'maintenance-pilote/etat',
 		'maintenance-pilote/sauvegardes',
 		'maintenance-pilote/verifier-site',
@@ -1969,6 +2136,11 @@ function mp_ability_names() {
 		'maintenance-pilote/publier-brouillon',
 		'maintenance-pilote/modifier-seo-article',
 	);
+	// Cette action n'existe que sur les sites où BK WEB Backup est actif.
+	if ( mp_bkwb_active() ) {
+		$names[] = 'maintenance-pilote/lancer-sauvegarde';
+	}
+	return $names;
 }
 
 function mp_mcp_url( $secret ) {
@@ -2276,13 +2448,40 @@ add_action(
 			'maintenance-pilote/sauvegardes',
 			array(
 				'label'               => 'Suivi des sauvegardes',
-				'description'         => 'Historique des sauvegardes WPvivid (réussies et échouées, avec leurs dates), planification et prochaine sauvegarde, stockage distant, dernière erreur, et autres extensions de sauvegarde actives. Lecture seule.',
+				'description'         => 'Historique des sauvegardes (réussies et échouées, avec leurs dates), planification et prochaine sauvegarde, stockage distant, sauvegarde en cours, dernière erreur, et autres extensions de sauvegarde actives. Source : BK WEB Backup s\'il est actif (champ « outil »), sinon WPvivid. Lecture seule.',
 				'category'            => 'maintenance-pilote',
 				'execute_callback'    => 'mp_ability_backups',
 				'permission_callback' => $can_plugins,
 				'meta'                => $meta( true, false, true ),
 			)
 		);
+
+		if ( mp_bkwb_active() ) {
+			wp_register_ability(
+				'maintenance-pilote/lancer-sauvegarde',
+				array(
+					'label'               => 'Lancer une sauvegarde',
+					'description'         => 'Lance une sauvegarde BK WEB Backup en arrière-plan (complète par défaut, ou base de données seule) et rend la main sans attendre la fin. Suivre l\'avancement avec maintenance-pilote/sauvegardes. Ne restaure rien et ne supprime rien.',
+					'category'            => 'maintenance-pilote',
+					'input_schema'        => array(
+						'type'                 => 'object',
+						'properties'           => array(
+							'contenu' => array(
+								'type'        => 'string',
+								'enum'        => array( 'full', 'db' ),
+								'description' => 'full : fichiers + base de données (par défaut) ; db : base de données seule.',
+							),
+						),
+						'additionalProperties' => false,
+					),
+					'execute_callback'    => 'mp_ability_start_backup',
+					'permission_callback' => function () {
+						return current_user_can( 'manage_options' );
+					},
+					'meta'                => $meta( false, false, false ),
+				)
+			);
+		}
 
 		wp_register_ability(
 			'maintenance-pilote/verifier-site',
@@ -2394,7 +2593,7 @@ add_action(
 			'maintenance-pilote/mettre-a-jour-wordpress',
 			array(
 				'label'               => 'Mettre à jour WordPress',
-				'description'         => 'Met à jour le cœur de WordPress. Pas de retour arrière automatique : ne lancer que si une sauvegarde complète récente a réussi.',
+				'description'         => 'Met à jour le cœur de WordPress. Pas de retour arrière automatique : ne lancer que si une sauvegarde complète récente a réussi. Si BK WEB Backup est actif, la mise à jour est refusée sans sauvegarde complète réussie depuis moins de ' . MP_CORE_BACKUP_MAX_HOURS . ' heures : une sauvegarde complète est alors lancée, et il faut relancer la mise à jour une fois qu\'elle est terminée.',
 				'category'            => 'maintenance-pilote',
 				'execute_callback'    => 'mp_ability_update_core',
 				'permission_callback' => function () {
